@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import List, Tuple, Union, Any
 import numpy as np
 from shap._explanation import Explanation
-from WrapperFunction import WrapperFunction
+# from WrapperFunction import WrapperFunction
 from utils2 import _mask_input, _generate_bitmasks, _insert, _insert_np, _factorial, _combinations, _n_k_bitmasks, _n_k_coefficient
 
 class Explainer(ABC):
@@ -221,5 +221,141 @@ class ShapleyValueExplainer(Explainer):
                             data=(np.array(sequence, dtype=object),),
                             output_names=output_names,
                             feature_names=[sequence])
+        else:
+            return values, base_values
+        
+class ScalableApproximationExplainer(Explainer):
+    """
+    Implements a scalable approximation method for explaining predictions of models wrapped by a WrapperFunction instance.
+    This explainer is designed to efficiently approximate the contribution of each feature to the model's prediction,
+    enabling a balance between computational complexity and explanation detail by adjusting the level of feature interactions considered.
+    """
+
+    def __init__(self, wrapper_function: WrapperFunction) -> None:
+        """
+        Initializes the ScalableApproximationExplainer with a specific WrapperFunction instance.
+
+        Parameters:
+            wrapper_function (WrapperFunction): An instance of WrapperFunction for model interaction and preprocessing.
+        """
+        super().__init__(wrapper_function)
+
+    def __call__(self, sequence, level, output_names, mask='[PAD]', collapse=True, exp_object=True):
+        """
+        Directly calls the explain method with the provided parameters, allowing the class instance to be used like a function.
+
+        Parameters:
+            sequence (str): The input text sequence to explain.
+            level (int): Specifies the depth of interaction among features to consider for explanation, offering a balance between detail and computational efficiency.
+            output_names (List[str]): The names of the outputs for which explanations are sought.
+            mask (str, optional): The token used for masking parts of the input sequence not currently being considered. Defaults to '[PAD]'.
+            collapse (bool, optional): Determines whether the masked input should be treated as a single concatenated string (True) or as separate tokens (False).
+            exp_object (bool, optional): Controls whether the explanation is returned as a rich `Explanation` object (True) or as raw numerical data (False).
+
+        Returns:
+            The result from the `explain` method, which could be an `Explanation` object or raw data, based on the `exp_object` parameter.
+        """
+        return self.explain(sequence, level, output_names, mask=mask, collapse=collapse, exp_object=exp_object)
+
+
+    def explain(self, sequence: str, level: int, output_names: List[str], mask: str = '[PAD]', collapse: bool = True, exp_object: bool = True):
+        """
+        Explains the contributions of features in a sequence to the model's prediction using a scalable approximation method.
+        Allows control over the computational complexity through the 'level' parameter, which dictates the maximum number of
+        features to interact in the approximation.
+
+        Parameters:
+            sequence (str): Input text sequence to be explained.
+            level (int): Determines the depth of feature interactions to consider, affecting the balance between detail and computational load.
+            output_names (List[str]): Names of model outputs for which to generate explanations.
+            mask (str, optional): Token used for masking parts of the sequence not under consideration. Defaults to '[PAD]'.
+            collapse (bool, optional): Specifies whether to collapse the sequence into a single string. Defaults to True.
+            exp_object (bool, optional): Indicates whether to return an Explanation object or raw data. Defaults to True.
+
+        Returns:
+            An Explanation object containing the explanation results, or raw numpy arrays depending on the 'exp_object' flag.
+        """
+
+        # Split sequence into individual features.
+        sequence = sequence.split(' ')
+        base_values = self.function([' '.join([mask]*len(sequence))])
+        n = len(sequence)
+
+        if not (level<=n and level>0):
+          raise ValueError('The approxmation level must be greater than 0 and less than or equal to the lenght of the sequence!')
+
+        # Level is the upper limit for depths
+        depth_lim = level-1
+
+        prediction = F([' '.join(sequence)])
+        pred_index = np.argmax(prediction)
+
+
+        # Initialize lists for storing padded sequences and their coefficients
+        coefficients = []
+        samples_plus = []
+        samples_minus = []
+
+        for idx,_ in enumerate(sequence):
+            for k in reversed(range(0, depth_lim+1,)):
+
+                bitmasks = _n_k_bitmasks(n-1, k)
+    
+                for bitmask in bitmasks:
+                    s_plus_mask = _insert_np(bitmask, idx, 1)
+                    s_minus_mask = _insert_np(bitmask, idx, 0)
+
+                    s_plus = " ".join(_mask_input(sequence,s_plus_mask,mask_token=mask))
+                    s_minus = " ".join(_mask_input(sequence,s_minus_mask,mask_token=mask))
+
+                    samples_plus.append(s_plus)
+                    samples_minus.append(s_minus)
+
+                    S = sum(bitmask)
+                    n = len(sequence)
+                    n_S_1 = n - S - 1
+
+                    coefficient = _factorial(S) * _factorial(n_S_1)/_factorial(n)
+                    coefficients.append(coefficient)
+
+        # Stack all samples for parallel computation
+        samples = samples_plus + samples_minus
+
+        # Feed all samples to the model at once
+        res = self.function(samples)
+
+        # Add new axis to broadcast
+        coefficients = np.array(coefficients)[:, np.newaxis]
+
+        # Find the middle point to split samples_plus and samples_minus
+        mid = int(res.shape[0] / 2)
+
+        # Calculate (sample_plus - sample_minus) * coefficient in parallel
+        res =  (res[:len(samples_plus)] - res[len(samples_plus):]) * coefficients
+
+        # Iterate over the results in chunks to extract results for each element in the sequence
+        chunk_size = res.shape[0] // len(sequence)
+
+        num_chunks = res.shape[0] // chunk_size
+
+        # Initialize the reduced array
+        values = np.zeros((num_chunks, res.shape[1]))
+
+        # Reduce the array by summing in chunks
+        for i in range(num_chunks):
+            chunk = res[i * chunk_size : (i + 1) * chunk_size]
+            values[i] = np.sum(chunk, axis=0)
+
+        # normalize values so that they sum up to the prediction to preserve efficiency
+        factor = (prediction[0,pred_index] - base_values[0,pred_index]) / np.sum(values[:,pred_index])
+        values = values*factor
+        values = values[np.newaxis,::]
+
+        if exp_object:
+            return Explanation(values=values.astype(np.float64),
+                                                base_values=base_values.astype(np.float64),
+                                                data=(np.array(sequence, dtype=object),),
+                                                output_names=output_names,
+                                                feature_names=[sequence])
         else:
             return values, base_values
