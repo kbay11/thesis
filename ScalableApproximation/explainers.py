@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import List, Tuple, Union, Any
 import numpy as np
 from shap._explanation import Explanation
-# from WrapperFunction import WrapperFunction
+from WrapperFunction import WrapperFunction
 from utils2 import _mask_input, _generate_bitmasks, _insert, _insert_np, _factorial, _combinations, _n_k_bitmasks, _n_k_coefficient
 
 class Explainer(ABC):
